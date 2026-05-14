@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.0.9] — 2026-05-14
+
+Maintenance release updating the project baseline from Go 1.24 to Go 1.25. No public API or behaviour changes.
+
+### Changed
+
+- **Go toolchain baseline**: Updated `go.mod` to require Go 1.25.
+- **Container builds**: Updated the source-build Docker image from `golang:1.24-alpine` to `golang:1.25-alpine`.
+- **CI and releases**: Updated GitHub Actions test, integration, lint, and release jobs to use Go 1.25.x.
+- **Lint tooling**: Updated the CI `golangci-lint` version from `v2.1.0` to `v2.4.0` for Go 1.25 support.
+- **Documentation**: Updated README badges and contributor/internal docs to advertise Go 1.25+.
+
+---
+
 ## [1.0.8] — 2026-05-12
 
 Internal quality release completing the integration-test harness. No public API or behaviour changes.

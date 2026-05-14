@@ -73,7 +73,7 @@ fix: resolve connection pool exhaustion under high load
 perf: reduce hot-path allocations with sync.Pool
 docs: update benchmark results for v1.0.0
 test: add integration tests for failover strategy
-chore: bump Go version to 1.24
+chore: bump Go version to 1.25
 ```
 
 ---

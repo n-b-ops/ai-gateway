@@ -16,7 +16,7 @@
 [![部署至 Railway: PostgreSQL](https://railway.com/button.svg)](https://railway.com/deploy/ferro-labs-ai-postgresql-storage?referralCode=KblxKX&utm_medium=integration&utm_source=template&utm_campaign=generic)
 [![部署至 Render: PostgreSQL](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/ferro-labs/ai-gateway)
 
-[![Go](https://img.shields.io/badge/go-1.24+-00ADD8.svg)](https://go.dev)
+[![Go](https://img.shields.io/badge/go-1.25+-00ADD8.svg)](https://go.dev)
 [![Go Reference](https://pkg.go.dev/badge/github.com/ferro-labs/ai-gateway.svg)](https://pkg.go.dev/github.com/ferro-labs/ai-gateway)
 [![codecov](https://codecov.io/gh/ferro-labs/ai-gateway/branch/main/graph/badge.svg)](https://codecov.io/gh/ferro-labs/ai-gateway)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
