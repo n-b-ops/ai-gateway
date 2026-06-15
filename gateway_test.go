@@ -19,6 +19,7 @@ import (
 	"github.com/ferro-labs/ai-gateway/internal/events"
 	"github.com/ferro-labs/ai-gateway/internal/logging"
 	"github.com/ferro-labs/ai-gateway/internal/metrics"
+	cacheplugin "github.com/ferro-labs/ai-gateway/internal/plugins/cache"
 	"github.com/ferro-labs/ai-gateway/mcp"
 	"github.com/ferro-labs/ai-gateway/models"
 	"github.com/ferro-labs/ai-gateway/plugin"
@@ -30,6 +31,9 @@ import (
 	_ "github.com/ferro-labs/ai-gateway/internal/plugins/maxtoken"
 	_ "github.com/ferro-labs/ai-gateway/internal/plugins/wordfilter"
 )
+
+// mockProviderName is the canonical provider name used by test mock providers.
+const mockProviderName = "mock"
 
 // mockProvider is a test double for providers.Provider.
 type mockProvider struct {
@@ -88,13 +92,34 @@ func counterValue(t *testing.T, c prometheus.Counter) float64 {
 
 func ptrFloat64(v float64) *float64 { return &v }
 
+func drainStream(t *testing.T, ch <-chan providers.StreamChunk) {
+	t.Helper()
+	for chunk := range ch {
+		if chunk.Error != nil {
+			t.Fatalf("stream chunk error: %v", chunk.Error)
+		}
+	}
+}
+
+func requireKeys(t *testing.T, got []string, want ...string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got keys %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("got keys %v, want %v", got, want)
+		}
+	}
+}
+
 func TestGateway_Route_Single(t *testing.T) {
 	gw, _ := New(Config{
 		Strategy: StrategyConfig{Mode: ModeSingle},
-		Targets:  []Target{{VirtualKey: "mock"}},
+		Targets:  []Target{{VirtualKey: mockProviderName}},
 	})
 	gw.RegisterProvider(&mockProvider{
-		name:   "mock",
+		name:   mockProviderName,
 		models: []string{"gpt-4o"},
 		resp:   &providers.Response{ID: "r1", Model: "gpt-4o"},
 	})
@@ -150,12 +175,12 @@ func TestGateway_Route_CostOptimizedPassesUnpricedStrategy(t *testing.T) {
 	}{
 		{
 			name:             "skip routes to priced provider",
-			unpricedStrategy: "skip",
+			unpricedStrategy: unpricedStrategySkip,
 			wantProvider:     "priced",
 		},
 		{
 			name:             "allow routes to unpriced provider",
-			unpricedStrategy: "allow",
+			unpricedStrategy: unpricedStrategyAllow,
 			wantProvider:     "unpriced",
 		},
 	}
@@ -429,6 +454,351 @@ func TestStreamingContentConditionMatchesPromptRegexRequiresCompiledRegex(t *tes
 	}
 }
 
+func TestGateway_RouteStream_LeastLatencyUsesObservedP50(t *testing.T) {
+	gw, err := New(Config{
+		Strategy: StrategyConfig{Mode: ModeLatency},
+		Targets: []Target{
+			{VirtualKey: "slow"},
+			{VirtualKey: "fast"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{name: "slow", models: []string{"gpt-4o"}},
+		streamErr:    errors.New("slow provider selected"),
+	})
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{name: "fast", models: []string{"gpt-4o"}},
+	})
+	gw.latencyTracker.Record("slow", 120*time.Millisecond)
+	gw.latencyTracker.Record("fast", 10*time.Millisecond)
+
+	ch, err := gw.RouteStream(context.Background(), providers.Request{
+		Model:    "gpt-4o",
+		Messages: []providers.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("RouteStream error = %v, want fast provider", err)
+	}
+	drainStream(t, ch)
+}
+
+func TestGateway_RouteStream_LeastLatencyRecordsStreamLatency(t *testing.T) {
+	gw, err := New(Config{
+		Strategy: StrategyConfig{Mode: ModeLatency},
+		Targets:  []Target{{VirtualKey: "stream"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{name: "stream", models: []string{"gpt-4o"}},
+	})
+
+	ch, err := gw.RouteStream(context.Background(), providers.Request{
+		Model:    "gpt-4o",
+		Messages: []providers.Message{{Role: "user", Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("RouteStream error = %v", err)
+	}
+	drainStream(t, ch)
+
+	if !gw.latencyTracker.HasSamples("stream") {
+		t.Fatal("expected RouteStream to record a latency sample")
+	}
+}
+
+func TestGateway_RouteStream_CostOptimizedUsesCatalogCost(t *testing.T) {
+	gw, err := New(Config{
+		Strategy: StrategyConfig{Mode: ModeCostOptimized},
+		Targets: []Target{
+			{VirtualKey: "expensive"},
+			{VirtualKey: "cheap"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw.catalog = models.Catalog{
+		"expensive/gpt-4o": {
+			Provider: "expensive",
+			ModelID:  "gpt-4o",
+			Mode:     models.ModeChat,
+			Pricing: models.Pricing{
+				InputPerMTokens: ptrFloat64(10),
+			},
+		},
+		"cheap/gpt-4o": {
+			Provider: "cheap",
+			ModelID:  "gpt-4o",
+			Mode:     models.ModeChat,
+			Pricing: models.Pricing{
+				InputPerMTokens: ptrFloat64(1),
+			},
+		},
+	}
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{name: "expensive", models: []string{"gpt-4o"}},
+		streamErr:    errors.New("expensive provider selected"),
+	})
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{name: "cheap", models: []string{"gpt-4o"}},
+	})
+
+	ch, err := gw.RouteStream(context.Background(), providers.Request{
+		Model:    "gpt-4o",
+		Messages: []providers.Message{{Role: "user", Content: "hello world"}},
+	})
+	if err != nil {
+		t.Fatalf("RouteStream error = %v, want cheap provider", err)
+	}
+	drainStream(t, ch)
+}
+
+func TestGateway_RouteStream_CostOptimizedSkipErrorsWhenAllStreamCandidatesUnpriced(t *testing.T) {
+	gw, err := New(Config{
+		Strategy: StrategyConfig{
+			Mode:             ModeCostOptimized,
+			UnpricedStrategy: unpricedStrategySkip,
+		},
+		Targets: []Target{
+			{VirtualKey: "first"},
+			{VirtualKey: "second"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw.catalog = models.Catalog{
+		"first/gpt-4o": {
+			Provider: "first",
+			ModelID:  "gpt-4o",
+			Mode:     models.ModeChat,
+			Pricing:  models.Pricing{},
+		},
+		"second/gpt-4o": {
+			Provider: "second",
+			ModelID:  "gpt-4o",
+			Mode:     models.ModeChat,
+			Pricing:  models.Pricing{},
+		},
+	}
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{name: "first", models: []string{"gpt-4o"}},
+		streamErr:    errors.New("first provider selected"),
+	})
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{name: "second", models: []string{"gpt-4o"}},
+		streamErr:    errors.New("second provider selected"),
+	})
+
+	_, err = gw.RouteStream(context.Background(), providers.Request{
+		Model:    "gpt-4o",
+		Messages: []providers.Message{{Role: "user", Content: "hello"}},
+	})
+	if err == nil {
+		t.Fatal("expected RouteStream to reject unpriced providers in skip mode")
+	}
+	if !strings.Contains(err.Error(), "no priced provider supports model gpt-4o") {
+		t.Fatalf("RouteStream error = %v, want no priced provider error", err)
+	}
+}
+
+func TestGateway_StreamingCostOrderHandlesUnpricedStrategies(t *testing.T) {
+	tests := []struct {
+		name             string
+		unpricedStrategy string
+		catalog          models.Catalog
+		want             []string
+	}{
+		{
+			name:             "skip puts priced providers first",
+			unpricedStrategy: unpricedStrategySkip,
+			catalog: models.Catalog{
+				"unpriced/gpt-4o": {
+					Provider: "unpriced",
+					ModelID:  "gpt-4o",
+					Mode:     models.ModeChat,
+					Pricing:  models.Pricing{},
+				},
+				"priced/gpt-4o": {
+					Provider: "priced",
+					ModelID:  "gpt-4o",
+					Mode:     models.ModeChat,
+					Pricing: models.Pricing{
+						InputPerMTokens: ptrFloat64(1),
+					},
+				},
+			},
+			want: []string{"priced", "unpriced", "missing", "plain"},
+		},
+		{
+			name:             "allow keeps model-found unpriced providers eligible",
+			unpricedStrategy: unpricedStrategyAllow,
+			catalog: models.Catalog{
+				"unpriced/gpt-4o": {
+					Provider: "unpriced",
+					ModelID:  "gpt-4o",
+					Mode:     models.ModeChat,
+					Pricing:  models.Pricing{},
+				},
+				"priced/gpt-4o": {
+					Provider: "priced",
+					ModelID:  "gpt-4o",
+					Mode:     models.ModeChat,
+					Pricing: models.Pricing{
+						InputPerMTokens: ptrFloat64(1),
+					},
+				},
+			},
+			want: []string{"unpriced", "priced", "missing", "plain"},
+		},
+		{
+			name: "fallback returns target order when nothing is priced",
+			catalog: models.Catalog{
+				"unpriced/gpt-4o": {
+					Provider: "unpriced",
+					ModelID:  "gpt-4o",
+					Mode:     models.ModeChat,
+					Pricing:  models.Pricing{},
+				},
+			},
+			want: []string{"unpriced", "priced", "missing", "plain"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gw, err := New(Config{
+				Strategy: StrategyConfig{
+					Mode:             ModeCostOptimized,
+					UnpricedStrategy: tt.unpricedStrategy,
+				},
+				Targets: []Target{
+					{VirtualKey: "unpriced"},
+					{VirtualKey: "priced"},
+					{VirtualKey: "missing"},
+					{VirtualKey: "plain"},
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			gw.catalog = tt.catalog
+			gw.RegisterProvider(&mockStreamProvider{
+				mockProvider: mockProvider{name: "unpriced", models: []string{"gpt-4o"}},
+			})
+			gw.RegisterProvider(&mockStreamProvider{
+				mockProvider: mockProvider{name: "priced", models: []string{"gpt-4o"}},
+			})
+			gw.RegisterProvider(&mockStreamProvider{
+				mockProvider: mockProvider{name: "missing", models: []string{"gpt-4o"}},
+			})
+			gw.RegisterProvider(&mockProvider{
+				name:   "plain",
+				models: []string{"gpt-4o"},
+			})
+
+			got, err := gw.streamingCostOrderLocked(gw.config.Targets, providers.Request{
+				Model:    "gpt-4o",
+				Messages: []providers.Message{{Role: "user", Content: "hello world"}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			requireKeys(t, got, tt.want...)
+		})
+	}
+}
+
+func TestGateway_StreamingLatencyOrderFallsBackWithoutStreamingCandidates(t *testing.T) {
+	gw, err := New(Config{
+		Strategy: StrategyConfig{Mode: ModeLatency},
+		Targets: []Target{
+			{VirtualKey: "plain"},
+			{VirtualKey: "unsupported"},
+			{VirtualKey: "missing"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw.RegisterProvider(&mockProvider{
+		name:   "plain",
+		models: []string{"gpt-4o"},
+	})
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{name: "unsupported", models: []string{"other-model"}},
+	})
+
+	got := gw.streamingLatencyOrderLocked(gw.config.Targets, providers.Request{Model: "gpt-4o"})
+	requireKeys(t, got, "plain", "unsupported", "missing")
+}
+
+func TestGateway_StreamingLatencyOrderTriesUnseenBeforeSampled(t *testing.T) {
+	gw, err := New(Config{
+		Strategy: StrategyConfig{Mode: ModeLatency},
+		Targets: []Target{
+			{VirtualKey: "unseen-a"},
+			{VirtualKey: "sampled"},
+			{VirtualKey: "unseen-b"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{name: "unseen-a", models: []string{"gpt-4o"}},
+	})
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{name: "sampled", models: []string{"gpt-4o"}},
+	})
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{name: "unseen-b", models: []string{"gpt-4o"}},
+	})
+	gw.latencyTracker.Record("sampled", 10*time.Millisecond)
+
+	got := gw.streamingLatencyOrderLocked(gw.config.Targets, providers.Request{Model: "gpt-4o"})
+	if got[2] != "sampled" {
+		t.Fatalf("got keys %v, want sampled provider after unseen providers", got)
+	}
+	firstTwoUnseen := (got[0] == "unseen-a" && got[1] == "unseen-b") ||
+		(got[0] == "unseen-b" && got[1] == "unseen-a")
+	if !firstTwoUnseen {
+		t.Fatalf("got keys %v, want unseen providers first", got)
+	}
+}
+
+func TestGateway_StreamingCostOrderFallsBackWithoutStreamingCandidates(t *testing.T) {
+	gw, err := New(Config{
+		Strategy: StrategyConfig{Mode: ModeCostOptimized},
+		Targets: []Target{
+			{VirtualKey: "plain"},
+			{VirtualKey: "unsupported"},
+			{VirtualKey: "missing"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw.RegisterProvider(&mockProvider{
+		name:   "plain",
+		models: []string{"gpt-4o"},
+	})
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{name: "unsupported", models: []string{"other-model"}},
+	})
+
+	got, err := gw.streamingCostOrderLocked(gw.config.Targets, providers.Request{Model: "gpt-4o"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireKeys(t, got, "plain", "unsupported", "missing")
+}
+
 func TestGateway_RouteStream_ImmediateFailure_IncrementsProviderErrors(t *testing.T) {
 	gw, _ := New(Config{
 		Strategy: StrategyConfig{Mode: ModeSingle},
@@ -497,6 +867,510 @@ func TestGateway_RouteStream_ImmediateCircuitOpen_IncrementsCircuitOpenProviderE
 	}
 }
 
+func streamTestRequest() providers.Request {
+	return providers.Request{
+		Model:    "gpt-4o",
+		Messages: []providers.Message{{Role: "user", Content: "hi"}},
+	}
+}
+
+func drainMeteredStream(t *testing.T, ch <-chan providers.StreamChunk) {
+	t.Helper()
+	for range ch { //nolint:revive
+	}
+}
+
+func TestGateway_RouteStream_StartupFailureTripsCircuitWithoutRoute(t *testing.T) {
+	gw, err := New(Config{
+		Strategy: StrategyConfig{Mode: ModeSingle},
+		Targets: []Target{{
+			VirtualKey: "flaky-stream",
+			CircuitBreaker: &CircuitBreakerConfig{
+				FailureThreshold: 2,
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{
+			name:   "flaky-stream",
+			models: []string{"gpt-4o"},
+		},
+		streamErr: errors.New("stream startup failed"),
+	})
+
+	req := streamTestRequest()
+	for i := 0; i < 2; i++ {
+		_, err := gw.RouteStream(context.Background(), req)
+		if err == nil {
+			t.Fatalf("attempt %d: expected startup error", i+1)
+		}
+	}
+
+	_, err = gw.RouteStream(context.Background(), req)
+	if !errors.Is(err, circuitbreaker.ErrCircuitOpen) {
+		t.Fatalf("expected circuit open, got %v", err)
+	}
+}
+
+func TestGateway_RouteStream_FallbackSkipsNonStreamingTargetWithCircuitBreaker(t *testing.T) {
+	var selected atomic.Value
+	gw, err := New(Config{
+		Strategy: StrategyConfig{Mode: ModeFallback},
+		Targets: []Target{
+			{
+				VirtualKey: "plain",
+				CircuitBreaker: &CircuitBreakerConfig{
+					FailureThreshold: 2,
+				},
+			},
+			{VirtualKey: "stream"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gw.RegisterProvider(&mockProvider{
+		name:   "plain",
+		models: []string{"gpt-4o"},
+	})
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{
+			name:   "stream",
+			models: []string{"gpt-4o"},
+		},
+		streamFn: func(_ context.Context, _ providers.Request) (<-chan providers.StreamChunk, error) {
+			selected.Store("stream")
+			ch := make(chan providers.StreamChunk, 1)
+			ch <- providers.StreamChunk{
+				ID: "stream-ok",
+				Choices: []providers.StreamChoice{{
+					Delta: providers.MessageDelta{Content: "ok"},
+				}},
+			}
+			close(ch)
+			return ch, nil
+		},
+	})
+
+	ch, err := gw.RouteStream(context.Background(), streamTestRequest())
+	if err != nil {
+		t.Fatalf("RouteStream error = %v, want streaming fallback target", err)
+	}
+	drainMeteredStream(t, ch)
+	if got := selected.Load(); got != "stream" {
+		t.Fatalf("selected provider = %v, want stream", got)
+	}
+}
+
+func TestGateway_RouteStream_StartupCancellationDoesNotTripCircuit(t *testing.T) {
+	gw, err := New(Config{
+		Strategy: StrategyConfig{Mode: ModeSingle},
+		Targets: []Target{{
+			VirtualKey: "flaky-stream",
+			CircuitBreaker: &CircuitBreakerConfig{
+				FailureThreshold: 2,
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{
+			name:   "flaky-stream",
+			models: []string{"gpt-4o"},
+		},
+		streamErr: context.Canceled,
+	})
+
+	req := streamTestRequest()
+	for i := 0; i < 3; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := gw.RouteStream(ctx, req)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("attempt %d: error = %v, want context.Canceled", i+1, err)
+		}
+	}
+
+	gw.mu.RLock()
+	cb := gw.circuitBreakers["flaky-stream"]
+	gw.mu.RUnlock()
+	if cb == nil {
+		t.Fatal("expected circuit breaker for flaky-stream")
+	}
+	if cb.State() != circuitbreaker.StateClosed {
+		t.Fatalf("circuit state = %v, want closed after startup cancellations", cb.State())
+	}
+}
+
+func TestGateway_Route_ProviderTimeoutTripsCircuit(t *testing.T) {
+	gw, err := New(Config{
+		Strategy: StrategyConfig{Mode: ModeSingle},
+		Targets: []Target{{
+			VirtualKey: "slow",
+			CircuitBreaker: &CircuitBreakerConfig{
+				FailureThreshold: 2,
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gw.RegisterProvider(&mockProvider{
+		name:   "slow",
+		models: []string{"gpt-4o"},
+		err:    context.DeadlineExceeded,
+	})
+
+	req := providers.Request{
+		Model:    "gpt-4o",
+		Messages: []providers.Message{{Role: "user", Content: "hi"}},
+	}
+	for i := 0; i < 2; i++ {
+		_, routeErr := gw.Route(context.Background(), req)
+		if !errors.Is(routeErr, context.DeadlineExceeded) {
+			t.Fatalf("attempt %d: error = %v, want context.DeadlineExceeded", i+1, routeErr)
+		}
+	}
+
+	_, routeErr := gw.Route(context.Background(), req)
+	if !errors.Is(routeErr, circuitbreaker.ErrCircuitOpen) {
+		t.Fatalf("expected circuit open after provider timeouts, got %v", routeErr)
+	}
+}
+
+func TestGateway_RouteStream_ProviderTimeoutTripsCircuit(t *testing.T) {
+	gw, err := New(Config{
+		Strategy: StrategyConfig{Mode: ModeSingle},
+		Targets: []Target{{
+			VirtualKey: "flaky-stream",
+			CircuitBreaker: &CircuitBreakerConfig{
+				FailureThreshold: 2,
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{
+			name:   "flaky-stream",
+			models: []string{"gpt-4o"},
+		},
+		streamErr: context.DeadlineExceeded,
+	})
+
+	req := streamTestRequest()
+	for i := 0; i < 2; i++ {
+		_, err := gw.RouteStream(context.Background(), req)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("attempt %d: error = %v, want context.DeadlineExceeded", i+1, err)
+		}
+	}
+
+	_, err = gw.RouteStream(context.Background(), req)
+	if !errors.Is(err, circuitbreaker.ErrCircuitOpen) {
+		t.Fatalf("expected circuit open after provider timeouts, got %v", err)
+	}
+}
+
+func TestShouldRecordCircuitBreakerFailure(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{
+			name: "nil error",
+			ctx:  context.Background(),
+			err:  nil,
+			want: false,
+		},
+		{
+			name: "provider timeout with live request context",
+			ctx:  context.Background(),
+			err:  context.DeadlineExceeded,
+			want: true,
+		},
+		{
+			name: "client deadline with canceled request context",
+			ctx: func() context.Context {
+				ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				cancel()
+				return ctx
+			}(),
+			err:  context.DeadlineExceeded,
+			want: false,
+		},
+		{
+			name: "client cancel with canceled request context",
+			ctx: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			}(),
+			err:  context.Canceled,
+			want: false,
+		},
+		{
+			name: "provider error with live request context",
+			ctx:  context.Background(),
+			err:  errors.New("upstream unavailable"),
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := shouldRecordCircuitBreakerFailure(tt.ctx, tt.err); got != tt.want {
+				t.Fatalf("shouldRecordCircuitBreakerFailure() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGateway_RouteStream_FallbackSkipsOpenCircuitBreakerTarget(t *testing.T) {
+	var selected atomic.Value
+	gw, err := New(Config{
+		Strategy: StrategyConfig{Mode: ModeFallback},
+		Targets: []Target{
+			{
+				VirtualKey: "flaky-stream",
+				CircuitBreaker: &CircuitBreakerConfig{
+					FailureThreshold: 2,
+				},
+			},
+			{VirtualKey: "healthy-stream"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{
+			name:   "flaky-stream",
+			models: []string{"gpt-4o"},
+		},
+		streamErr: errors.New("stream startup failed"),
+	})
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{
+			name:   "healthy-stream",
+			models: []string{"gpt-4o"},
+		},
+		streamFn: func(_ context.Context, _ providers.Request) (<-chan providers.StreamChunk, error) {
+			selected.Store("healthy-stream")
+			ch := make(chan providers.StreamChunk, 1)
+			ch <- providers.StreamChunk{
+				ID: "healthy-ok",
+				Choices: []providers.StreamChoice{{
+					Delta: providers.MessageDelta{Content: "ok"},
+				}},
+			}
+			close(ch)
+			return ch, nil
+		},
+	})
+
+	req := streamTestRequest()
+	for i := 0; i < 2; i++ {
+		_, err := gw.RouteStream(context.Background(), req)
+		if err == nil {
+			t.Fatalf("attempt %d: expected startup error to trip breaker", i+1)
+		}
+	}
+
+	ch, err := gw.RouteStream(context.Background(), req)
+	if err != nil {
+		t.Fatalf("RouteStream error = %v, want healthy-stream fallback", err)
+	}
+	drainMeteredStream(t, ch)
+	if got := selected.Load(); got != "healthy-stream" {
+		t.Fatalf("selected provider = %v, want healthy-stream", got)
+	}
+}
+
+type slowCompleteProvider struct {
+	mockProvider
+}
+
+func (p *slowCompleteProvider) Complete(ctx context.Context, _ providers.Request) (*providers.Response, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(500 * time.Millisecond):
+		return &providers.Response{ID: "ok"}, nil
+	}
+}
+
+func TestGateway_Route_ClientDeadlineDoesNotTripCircuit(t *testing.T) {
+	gw, err := New(Config{
+		Strategy: StrategyConfig{Mode: ModeSingle},
+		Targets: []Target{{
+			VirtualKey: "slow",
+			CircuitBreaker: &CircuitBreakerConfig{
+				FailureThreshold: 2,
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gw.RegisterProvider(&slowCompleteProvider{
+		mockProvider: mockProvider{
+			name:   "slow",
+			models: []string{"gpt-4o"},
+		},
+	})
+
+	req := providers.Request{
+		Model:    "gpt-4o",
+		Messages: []providers.Message{{Role: "user", Content: "hi"}},
+	}
+	for i := 0; i < 2; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		_, routeErr := gw.Route(ctx, req)
+		cancel()
+		if !errors.Is(routeErr, context.DeadlineExceeded) {
+			t.Fatalf("attempt %d: error = %v, want context.DeadlineExceeded", i+1, routeErr)
+		}
+	}
+
+	gw.mu.RLock()
+	cb := gw.circuitBreakers["slow"]
+	gw.mu.RUnlock()
+	if cb == nil {
+		t.Fatal("expected circuit breaker for slow")
+	}
+	if cb.State() != circuitbreaker.StateClosed {
+		t.Fatalf("circuit state = %v, want closed after client deadlines", cb.State())
+	}
+}
+
+func TestGateway_RouteStream_ClientDeadlineDoesNotTripCircuit(t *testing.T) {
+	gw, err := New(Config{
+		Strategy: StrategyConfig{Mode: ModeSingle},
+		Targets: []Target{{
+			VirtualKey: "slow-stream",
+			CircuitBreaker: &CircuitBreakerConfig{
+				FailureThreshold: 2,
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{
+			name:   "slow-stream",
+			models: []string{"gpt-4o"},
+		},
+		streamFn: func(ctx context.Context, _ providers.Request) (<-chan providers.StreamChunk, error) {
+			ch := make(chan providers.StreamChunk)
+			go func() {
+				defer close(ch)
+				ticker := time.NewTicker(20 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						select {
+						case ch <- providers.StreamChunk{
+							Choices: []providers.StreamChoice{{
+								Delta: providers.MessageDelta{Content: "x"},
+							}},
+						}:
+						case <-ctx.Done():
+							return
+						}
+					}
+				}
+			}()
+			return ch, nil
+		},
+	})
+
+	req := streamTestRequest()
+	for i := 0; i < 2; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		ch, streamErr := gw.RouteStream(ctx, req)
+		if streamErr != nil {
+			cancel()
+			t.Fatalf("attempt %d: RouteStream error = %v", i+1, streamErr)
+		}
+		for range ch { //nolint:revive
+		}
+		cancel()
+	}
+
+	gw.mu.RLock()
+	cb := gw.circuitBreakers["slow-stream"]
+	gw.mu.RUnlock()
+	if cb == nil {
+		t.Fatal("expected circuit breaker for slow-stream")
+	}
+	if cb.State() != circuitbreaker.StateClosed {
+		t.Fatalf("circuit state = %v, want closed after client deadlines", cb.State())
+	}
+}
+
+func TestGateway_RouteStream_MidStreamFailureTripsCircuit(t *testing.T) {
+	streamErr := errors.New("mid-stream provider failure")
+	gw, err := New(Config{
+		Strategy: StrategyConfig{Mode: ModeSingle},
+		Targets: []Target{{
+			VirtualKey: "flaky-stream",
+			CircuitBreaker: &CircuitBreakerConfig{
+				FailureThreshold: 2,
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{
+			name:   "flaky-stream",
+			models: []string{"gpt-4o"},
+		},
+		streamFn: func(_ context.Context, _ providers.Request) (<-chan providers.StreamChunk, error) {
+			ch := make(chan providers.StreamChunk, 2)
+			ch <- providers.StreamChunk{
+				Choices: []providers.StreamChoice{{
+					Delta: providers.MessageDelta{Content: "partial"},
+				}},
+			}
+			ch <- providers.StreamChunk{Error: streamErr}
+			close(ch)
+			return ch, nil
+		},
+	})
+
+	req := streamTestRequest()
+	for i := 0; i < 2; i++ {
+		ch, err := gw.RouteStream(context.Background(), req)
+		if err != nil {
+			t.Fatalf("attempt %d: RouteStream error = %v", i+1, err)
+		}
+		drainMeteredStream(t, ch)
+	}
+
+	_, err = gw.RouteStream(context.Background(), req)
+	if !errors.Is(err, circuitbreaker.ErrCircuitOpen) {
+		t.Fatalf("expected circuit open after mid-stream failures, got %v", err)
+	}
+}
+
 func TestGateway_RouteStream_BeforePluginCanSetNilRequest(t *testing.T) {
 	gw, _ := New(Config{
 		Strategy: StrategyConfig{Mode: ModeSingle},
@@ -518,6 +1392,294 @@ func TestGateway_RouteStream_BeforePluginCanSetNilRequest(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for missing streaming provider")
+	}
+}
+
+func TestGateway_RouteStream_RunAfterReceivesStreamResponse(t *testing.T) {
+	gw, _ := New(Config{
+		Strategy: StrategyConfig{Mode: ModeSingle},
+		Targets:  []Target{{VirtualKey: mockProviderName}},
+	})
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{name: mockProviderName, models: []string{"gpt-4o"}},
+		streamFn: func(context.Context, providers.Request) (<-chan providers.StreamChunk, error) {
+			ch := make(chan providers.StreamChunk, 3)
+			ch <- providers.StreamChunk{
+				ID:      "chatcmpl-stream",
+				Object:  "chat.completion.chunk",
+				Created: 123,
+				Model:   "gpt-4o",
+				Choices: []providers.StreamChoice{{
+					Index: 0,
+					Delta: providers.MessageDelta{Role: "assistant", Content: "hello "},
+				}},
+			}
+			ch <- providers.StreamChunk{
+				ID:      "chatcmpl-stream",
+				Object:  "chat.completion.chunk",
+				Created: 123,
+				Model:   "gpt-4o",
+				Choices: []providers.StreamChoice{{
+					Index:        0,
+					Delta:        providers.MessageDelta{Content: "world"},
+					FinishReason: "stop",
+				}},
+			}
+			ch <- providers.StreamChunk{
+				ID:      "chatcmpl-stream",
+				Object:  "chat.completion.chunk",
+				Created: 123,
+				Model:   "gpt-4o",
+				Usage:   &providers.Usage{PromptTokens: 2, CompletionTokens: 3, TotalTokens: 5},
+			}
+			close(ch)
+			return ch, nil
+		},
+	})
+
+	var afterCalls int
+	_ = gw.RegisterPlugin(plugin.StageAfterRequest, &testPlugin{
+		name: "after",
+		typ:  plugin.TypeLogging,
+		execFn: func(_ context.Context, pctx *plugin.Context) error {
+			afterCalls++
+			if pctx.Request == nil {
+				t.Fatal("after plugin request is nil")
+			}
+			if pctx.Response == nil {
+				t.Fatal("after plugin response is nil")
+			}
+			if pctx.Response.Provider != mockProviderName {
+				t.Fatalf("after plugin provider = %q, want mock", pctx.Response.Provider)
+			}
+			if pctx.Response.Model != "gpt-4o" {
+				t.Fatalf("after plugin model = %q, want gpt-4o", pctx.Response.Model)
+			}
+			if pctx.Response.Usage.TotalTokens != 5 {
+				t.Fatalf("after plugin total tokens = %d, want 5", pctx.Response.Usage.TotalTokens)
+			}
+			if got := pctx.Response.Choices[0].Message.Content; got != "hello world" {
+				t.Fatalf("after plugin content = %q, want hello world", got)
+			}
+			return nil
+		},
+	})
+
+	ch, err := gw.RouteStream(context.Background(), providers.Request{
+		Model:    "gpt-4o",
+		Messages: []providers.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	})
+	if err != nil {
+		t.Fatalf("RouteStream: %v", err)
+	}
+	drainStream(t, ch)
+
+	if afterCalls != 1 {
+		t.Fatalf("after plugin calls = %d, want 1", afterCalls)
+	}
+}
+
+func TestGateway_RouteStream_RunOnErrorReceivesStreamError(t *testing.T) {
+	streamErr := errors.New("stream failed")
+	gw, _ := New(Config{
+		Strategy: StrategyConfig{Mode: ModeSingle},
+		Targets:  []Target{{VirtualKey: mockProviderName}},
+	})
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{name: mockProviderName, models: []string{"gpt-4o"}},
+		streamFn: func(context.Context, providers.Request) (<-chan providers.StreamChunk, error) {
+			ch := make(chan providers.StreamChunk, 1)
+			ch <- providers.StreamChunk{Error: streamErr}
+			close(ch)
+			return ch, nil
+		},
+	})
+
+	var onErrorCalls int
+	_ = gw.RegisterPlugin(plugin.StageOnError, &testPlugin{
+		name: "on-error",
+		typ:  plugin.TypeLogging,
+		execFn: func(_ context.Context, pctx *plugin.Context) error {
+			onErrorCalls++
+			if !errors.Is(pctx.Error, streamErr) {
+				t.Fatalf("on-error plugin error = %v, want %v", pctx.Error, streamErr)
+			}
+			if pctx.Response != nil {
+				t.Fatalf("on-error plugin response = %#v, want nil", pctx.Response)
+			}
+			return nil
+		},
+	})
+
+	ch, err := gw.RouteStream(context.Background(), providers.Request{
+		Model:    "gpt-4o",
+		Messages: []providers.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	})
+	if err != nil {
+		t.Fatalf("RouteStream: %v", err)
+	}
+	for chunk := range ch {
+		if !errors.Is(chunk.Error, streamErr) {
+			t.Fatalf("stream chunk error = %v, want %v", chunk.Error, streamErr)
+		}
+	}
+
+	if onErrorCalls != 1 {
+		t.Fatalf("on-error plugin calls = %d, want 1", onErrorCalls)
+	}
+}
+
+func TestGateway_RouteStream_AfterPluginRejectRunsOnError(t *testing.T) {
+	gw, _ := New(Config{
+		Strategy: StrategyConfig{Mode: ModeSingle},
+		Targets:  []Target{{VirtualKey: mockProviderName}},
+	})
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{name: mockProviderName, models: []string{"gpt-4o"}},
+		streamFn: func(context.Context, providers.Request) (<-chan providers.StreamChunk, error) {
+			ch := make(chan providers.StreamChunk, 2)
+			ch <- providers.StreamChunk{
+				Model: "gpt-4o",
+				Choices: []providers.StreamChoice{{
+					Index:        0,
+					Delta:        providers.MessageDelta{Role: "assistant", Content: "ok"},
+					FinishReason: "stop",
+				}},
+			}
+			ch <- providers.StreamChunk{
+				Usage: &providers.Usage{PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2},
+			}
+			close(ch)
+			return ch, nil
+		},
+	})
+
+	var onErrorCalls int
+	_ = gw.RegisterPlugin(plugin.StageAfterRequest, &testPlugin{
+		name: "after",
+		typ:  plugin.TypeLogging,
+		execFn: func(_ context.Context, pctx *plugin.Context) error {
+			pctx.Reject = true
+			pctx.Reason = "after plugin rejected"
+			return nil
+		},
+	})
+	_ = gw.RegisterPlugin(plugin.StageOnError, &testPlugin{
+		name: "on-error",
+		typ:  plugin.TypeLogging,
+		execFn: func(_ context.Context, pctx *plugin.Context) error {
+			onErrorCalls++
+			var rejection *plugin.RejectionError
+			if !errors.As(pctx.Error, &rejection) {
+				t.Fatalf("on-error plugin error = %T(%v), want *plugin.RejectionError", pctx.Error, pctx.Error)
+			}
+			return nil
+		},
+	})
+
+	ch, err := gw.RouteStream(context.Background(), providers.Request{
+		Model:    "gpt-4o",
+		Messages: []providers.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	})
+	if err != nil {
+		t.Fatalf("RouteStream: %v", err)
+	}
+	var sawPluginErr bool
+	for chunk := range ch {
+		if chunk.Error != nil {
+			sawPluginErr = true
+		}
+	}
+	if !sawPluginErr {
+		t.Fatal("expected stream chunk carrying after plugin rejection error")
+	}
+	if onErrorCalls != 1 {
+		t.Fatalf("on-error plugin calls = %d, want 1", onErrorCalls)
+	}
+}
+
+func TestGateway_RouteStream_ResponseCacheHitSkipsProvider(t *testing.T) {
+	gw, _ := New(Config{
+		Strategy: StrategyConfig{Mode: ModeSingle},
+		Targets:  []Target{{VirtualKey: mockProviderName}},
+	})
+	var streamCalls atomic.Int32
+	gw.RegisterProvider(&mockStreamProvider{
+		mockProvider: mockProvider{name: mockProviderName, models: []string{"gpt-4o"}},
+		streamFn: func(context.Context, providers.Request) (<-chan providers.StreamChunk, error) {
+			streamCalls.Add(1)
+			ch := make(chan providers.StreamChunk, 2)
+			ch <- providers.StreamChunk{
+				ID:      "chatcmpl-cacheable",
+				Object:  "chat.completion.chunk",
+				Created: 123,
+				Model:   "gpt-4o",
+				Choices: []providers.StreamChoice{{
+					Index:        0,
+					Delta:        providers.MessageDelta{Role: "assistant", Content: "cached"},
+					FinishReason: "stop",
+				}},
+			}
+			ch <- providers.StreamChunk{
+				ID:      "chatcmpl-cacheable",
+				Object:  "chat.completion.chunk",
+				Created: 123,
+				Model:   "gpt-4o",
+				Usage:   &providers.Usage{PromptTokens: 1, CompletionTokens: 1, TotalTokens: 2},
+			}
+			close(ch)
+			return ch, nil
+		},
+	})
+	cache := &cacheplugin.ResponseCache{}
+	if err := cache.Init(map[string]interface{}{"max_age": 60}); err != nil {
+		t.Fatalf("cache init: %v", err)
+	}
+	_ = gw.RegisterPlugin(plugin.StageBeforeRequest, cache)
+	_ = gw.RegisterPlugin(plugin.StageAfterRequest, cache)
+
+	req := providers.Request{
+		Model:    "gpt-4o",
+		Messages: []providers.Message{{Role: "user", Content: "hi"}},
+		Stream:   true,
+	}
+	first, err := gw.RouteStream(context.Background(), req)
+	if err != nil {
+		t.Fatalf("first RouteStream: %v", err)
+	}
+	drainStream(t, first)
+	if got := streamCalls.Load(); got != 1 {
+		t.Fatalf("stream calls after first request = %d, want 1", got)
+	}
+
+	second, err := gw.RouteStream(context.Background(), req)
+	if err != nil {
+		t.Fatalf("second RouteStream: %v", err)
+	}
+	var content string
+	var usage *providers.Usage
+	for chunk := range second {
+		if chunk.Error != nil {
+			t.Fatalf("cached stream chunk error: %v", chunk.Error)
+		}
+		for _, choice := range chunk.Choices {
+			content += choice.Delta.Content
+		}
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
+	}
+	if got := streamCalls.Load(); got != 1 {
+		t.Fatalf("stream calls after cache hit = %d, want 1", got)
+	}
+	if content != "cached" {
+		t.Fatalf("cached stream content = %q, want cached", content)
+	}
+	if usage == nil || usage.TotalTokens != 2 {
+		t.Fatalf("cached stream usage = %#v, want total tokens 2", usage)
 	}
 }
 
@@ -626,7 +1788,7 @@ func (p *gateStreamProvider) CompleteStream(_ context.Context, _ providers.Reque
 func completedHookEvent(traceID string) events.HookEvent {
 	return events.CompletedRequest(
 		traceID,
-		"mock",
+		mockProviderName,
 		"gpt-4o",
 		time.Millisecond,
 		false,
@@ -635,6 +1797,44 @@ func completedHookEvent(traceID string) events.HookEvent {
 		models.CostResult{},
 		true,
 	)
+}
+
+// TestGateway_PublishEvent_DetachesCancellationButPreservesValues covers
+// issue #181: async event hooks must run with a context that has shed the
+// request's cancellation (they fire after the HTTP handler returns) yet still
+// carry the request's trace context / values via context.WithoutCancel.
+func TestGateway_PublishEvent_DetachesCancellationButPreservesValues(t *testing.T) {
+	gw, err := New(Config{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = gw.Close() })
+
+	type ctxKey string
+	const marker ctxKey = "trace-marker"
+
+	got := make(chan context.Context, 1)
+	gw.AddHook(func(ctx context.Context, _ string, _ map[string]any) {
+		got <- ctx
+	})
+
+	// The request context is already cancelled by the time the hook runs.
+	reqCtx, cancel := context.WithCancel(context.WithValue(context.Background(), marker, "trace-xyz"))
+	cancel()
+
+	gw.publishEvent(reqCtx, completedHookEvent("trace-1"))
+
+	select {
+	case hookCtx := <-got:
+		if err := hookCtx.Err(); err != nil {
+			t.Fatalf("hook ctx should be detached from cancellation, got %v", err)
+		}
+		if v, _ := hookCtx.Value(marker).(string); v != "trace-xyz" {
+			t.Fatalf("hook ctx lost request trace value: got %q, want trace-xyz", v)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("hook was not dispatched")
+	}
 }
 
 func runWithPanicCapture(t *testing.T, fn func()) any {
@@ -1019,10 +2219,10 @@ func TestGateway_Route_ProviderNotFound(t *testing.T) {
 func TestGateway_Route_HookPanicIsRecovered(t *testing.T) {
 	gw, _ := New(Config{
 		Strategy: StrategyConfig{Mode: ModeSingle},
-		Targets:  []Target{{VirtualKey: "mock"}},
+		Targets:  []Target{{VirtualKey: mockProviderName}},
 	})
 	gw.RegisterProvider(&mockProvider{
-		name:   "mock",
+		name:   mockProviderName,
 		models: []string{"gpt-4o"},
 		resp:   &providers.Response{ID: "ok", Model: "gpt-4o"},
 	})
@@ -1061,7 +2261,7 @@ func TestGateway_PublishEvent_CallsAllHooks(t *testing.T) {
 
 	gw.publishEvent(context.Background(), events.CompletedRequest(
 		"trace-123",
-		"mock",
+		mockProviderName,
 		"gpt-4o",
 		time.Millisecond,
 		false,
@@ -1095,7 +2295,7 @@ func TestGateway_PublishEvent_EnqueuesEachHookIndividually(t *testing.T) {
 
 	gw.publishEvent(context.Background(), events.CompletedRequest(
 		"trace-123",
-		"mock",
+		mockProviderName,
 		"gpt-4o",
 		time.Millisecond,
 		false,
@@ -1113,7 +2313,7 @@ func TestGateway_PublishEvent_EnqueuesEachHookIndividually(t *testing.T) {
 func TestRunHookDispatch_CreatesFreshPayloadMapPerHook(t *testing.T) {
 	event := events.CompletedRequest(
 		"trace-123",
-		"mock",
+		mockProviderName,
 		"gpt-4o",
 		time.Millisecond,
 		false,
@@ -1145,7 +2345,7 @@ func TestRunHookDispatch_CreatesFreshPayloadMapPerHook(t *testing.T) {
 	if got := firstData["provider"]; got != "mutated" {
 		t.Fatalf("first hook provider = %v, want mutated", got)
 	}
-	if secondProvider != "mock" {
+	if secondProvider != mockProviderName {
 		t.Fatalf("second hook provider = %q, want mock", secondProvider)
 	}
 }
@@ -1163,11 +2363,11 @@ func TestGateway_PublishEvent_IncrementsDropMetricWhenQueueFull(t *testing.T) {
 
 	// Fill the queue.
 	gw.publishEvent(context.Background(), events.CompletedRequest(
-		"trace-fill", "mock", "gpt-4o", time.Millisecond, false, 1, 1, models.CostResult{}, true,
+		"trace-fill", mockProviderName, "gpt-4o", time.Millisecond, false, 1, 1, models.CostResult{}, true,
 	))
 	// This one should be dropped.
 	gw.publishEvent(context.Background(), events.CompletedRequest(
-		"trace-drop", "mock", "gpt-4o", time.Millisecond, false, 1, 1, models.CostResult{}, true,
+		"trace-drop", mockProviderName, "gpt-4o", time.Millisecond, false, 1, 1, models.CostResult{}, true,
 	))
 
 	after := counterValue(t, counter)
@@ -1196,10 +2396,10 @@ func (p *testPlugin) Execute(ctx context.Context, pctx *plugin.Context) error {
 func TestGateway_Route_WithBeforePlugin(t *testing.T) {
 	gw, _ := New(Config{
 		Strategy: StrategyConfig{Mode: ModeSingle},
-		Targets:  []Target{{VirtualKey: "mock"}},
+		Targets:  []Target{{VirtualKey: mockProviderName}},
 	})
 	gw.RegisterProvider(&mockProvider{
-		name:   "mock",
+		name:   mockProviderName,
 		models: []string{"gpt-4o"},
 		resp:   &providers.Response{ID: "ok"},
 	})
@@ -1229,10 +2429,10 @@ func TestGateway_Route_WithBeforePlugin(t *testing.T) {
 func TestGateway_Route_PluginRejectsRequest(t *testing.T) {
 	gw, _ := New(Config{
 		Strategy: StrategyConfig{Mode: ModeSingle},
-		Targets:  []Target{{VirtualKey: "mock"}},
+		Targets:  []Target{{VirtualKey: mockProviderName}},
 	})
 	gw.RegisterProvider(&mockProvider{
-		name:   "mock",
+		name:   mockProviderName,
 		models: []string{"gpt-4o"},
 		resp:   &providers.Response{ID: "should-not-reach"},
 	})
@@ -1265,7 +2465,7 @@ func init() {
 func TestGateway_LoadPlugins(t *testing.T) {
 	gw, _ := New(Config{
 		Strategy: StrategyConfig{Mode: ModeSingle},
-		Targets:  []Target{{VirtualKey: "mock"}},
+		Targets:  []Target{{VirtualKey: mockProviderName}},
 		Plugins: []PluginConfig{
 			{
 				Name:    "test-plugin",
@@ -1277,7 +2477,7 @@ func TestGateway_LoadPlugins(t *testing.T) {
 		},
 	})
 	gw.RegisterProvider(&mockProvider{
-		name:   "mock",
+		name:   mockProviderName,
 		models: []string{"gpt-4o"},
 		resp:   &providers.Response{ID: "ok"},
 	})
@@ -1293,7 +2493,7 @@ func TestGateway_LoadPlugins(t *testing.T) {
 func TestGateway_LoadPlugins_UnknownPlugin(t *testing.T) {
 	gw, _ := New(Config{
 		Strategy: StrategyConfig{Mode: ModeSingle},
-		Targets:  []Target{{VirtualKey: "mock"}},
+		Targets:  []Target{{VirtualKey: mockProviderName}},
 		Plugins: []PluginConfig{
 			{
 				Name:    "does-not-exist",
@@ -1343,13 +2543,13 @@ func (m *mockImageProvider) GenerateImage(_ context.Context, req providers.Image
 func TestGateway_Embed_ResolvesAlias(t *testing.T) {
 	ep := &mockEmbeddingProvider{
 		mockProvider: mockProvider{
-			name:   "mock",
+			name:   mockProviderName,
 			models: []string{"text-embedding-3-small"},
 		},
 	}
 	gw, _ := New(Config{
 		Strategy: StrategyConfig{Mode: ModeSingle},
-		Targets:  []Target{{VirtualKey: "mock"}},
+		Targets:  []Target{{VirtualKey: mockProviderName}},
 		Aliases:  map[string]string{"my-embed": "text-embedding-3-small"},
 	})
 	gw.RegisterProvider(ep)
@@ -1369,13 +2569,13 @@ func TestGateway_Embed_ResolvesAlias(t *testing.T) {
 func TestGateway_Embed_NoAliasPassthrough(t *testing.T) {
 	ep := &mockEmbeddingProvider{
 		mockProvider: mockProvider{
-			name:   "mock",
+			name:   mockProviderName,
 			models: []string{"text-embedding-3-small"},
 		},
 	}
 	gw, _ := New(Config{
 		Strategy: StrategyConfig{Mode: ModeSingle},
-		Targets:  []Target{{VirtualKey: "mock"}},
+		Targets:  []Target{{VirtualKey: mockProviderName}},
 	})
 	gw.RegisterProvider(ep)
 
@@ -1394,13 +2594,13 @@ func TestGateway_Embed_NoAliasPassthrough(t *testing.T) {
 func TestGateway_GenerateImage_ResolvesAlias(t *testing.T) {
 	ip := &mockImageProvider{
 		mockProvider: mockProvider{
-			name:   "mock",
+			name:   mockProviderName,
 			models: []string{"dall-e-3"},
 		},
 	}
 	gw, _ := New(Config{
 		Strategy: StrategyConfig{Mode: ModeSingle},
-		Targets:  []Target{{VirtualKey: "mock"}},
+		Targets:  []Target{{VirtualKey: mockProviderName}},
 		Aliases:  map[string]string{"my-image-model": "dall-e-3"},
 	})
 	gw.RegisterProvider(ip)

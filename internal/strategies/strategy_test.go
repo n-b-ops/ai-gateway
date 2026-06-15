@@ -2,6 +2,7 @@ package strategies
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -248,8 +249,11 @@ func TestFallback_ContextCancelled(t *testing.T) {
 	cancel() // cancel immediately
 
 	_, err := f.Execute(ctx, providers.Request{Model: "gpt-4o", Messages: []providers.Message{{Role: "user", Content: "hi"}}})
-	if err == nil {
-		t.Fatal("expected error on cancelled context")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if bad.calls != 0 {
+		t.Fatalf("cancelled context should not call provider, got %d calls", bad.calls)
 	}
 }
 
