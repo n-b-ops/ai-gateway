@@ -3,6 +3,7 @@ package providers
 import (
 	ai21pkg "github.com/ferro-labs/ai-gateway/providers/ai21"
 	anthropicpkg "github.com/ferro-labs/ai-gateway/providers/anthropic"
+	zaipkg "github.com/ferro-labs/ai-gateway/providers/zai"
 	azurefoundrypkg "github.com/ferro-labs/ai-gateway/providers/azure_foundry"
 	azureopenaipkg "github.com/ferro-labs/ai-gateway/providers/azure_openai"
 	bedrockpkg "github.com/ferro-labs/ai-gateway/providers/bedrock"
@@ -84,6 +85,9 @@ const (
 
 	// NameXAI is the canonical name for the xAI (Grok) provider.
 	NameXAI = xaipkg.Name
+
+	// NameZAI is the canonical name for the z.ai Anthropic-compatible provider.
+	NameZAI = zaipkg.Name
 
 	// NameAzureOpenAI is the canonical name for the Azure OpenAI provider.
 	NameAzureOpenAI = azureopenaipkg.Name
@@ -175,5 +179,6 @@ func AllProviderNames() []string {
 		NameTogether,
 		NameVertexAI,
 		NameXAI,
+		NameZAI,
 	}
 }
