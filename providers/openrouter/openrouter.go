@@ -91,6 +91,7 @@ func (p *Provider) DiscoverModels(ctx context.Context) ([]core.ModelInfo, error)
 
 // Complete sends a chat completion request to OpenRouter.
 func (p *Provider) Complete(ctx context.Context, req core.Request) (*core.Response, error) {
+	req.Model = p.resolveModel(req.Model)
 	return openaicompat.PostChat(ctx, openaicompat.ChatParams{
 		HTTPClient: p.httpClient,
 		URL:        p.baseURL + "/chat/completions",
@@ -102,6 +103,7 @@ func (p *Provider) Complete(ctx context.Context, req core.Request) (*core.Respon
 
 // CompleteStream sends a streaming chat completion request to OpenRouter.
 func (p *Provider) CompleteStream(ctx context.Context, req core.Request) (<-chan core.StreamChunk, error) {
+	req.Model = p.resolveModel(req.Model)
 	return openaicompat.PostStream(ctx, openaicompat.ChatParams{
 		HTTPClient: p.httpClient,
 		URL:        p.baseURL + "/chat/completions",
