@@ -101,10 +101,10 @@ func (p *Provider) SupportedModels() []string {
 }
 
 // SupportsModel returns true for models this provider can handle.
-// Accepts claude-* models (native Anthropic) and zai-* (routing prefix).
+// Only accepts zai-* and zai/* (routing prefixes) — NOT claude-*
+// directly, to avoid stealing requests from the anthropic provider.
 func (p *Provider) SupportsModel(model string) bool {
-	return strings.HasPrefix(model, "claude-") ||
-		strings.HasPrefix(model, "zai-") ||
+	return strings.HasPrefix(model, "zai-") ||
 		strings.HasPrefix(model, "zai/")
 }
 
