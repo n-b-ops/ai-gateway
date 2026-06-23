@@ -100,14 +100,26 @@ func (p *Provider) SupportedModels() []string {
 	}
 }
 
-// SupportsModel returns true if the model matches the Anthropic prefix.
+// SupportsModel returns true for models this provider can handle.
+// Accepts claude-* models (native Anthropic) and zai-* (routing prefix).
 func (p *Provider) SupportsModel(model string) bool {
-	return strings.HasPrefix(model, "claude-")
+	return strings.HasPrefix(model, "claude-") ||
+		strings.HasPrefix(model, "zai-") ||
+		strings.HasPrefix(model, "zai/")
 }
 
 // Models returns model information for all supported models.
 func (p *Provider) Models() []core.ModelInfo {
 	return core.ModelsFromList(p.name, p.SupportedModels())
+}
+
+// resolveModel strips routing prefixes from the model name before sending to z.ai.
+// Ferro routes requests by model prefix (e.g. "zai-"), but z.ai expects the
+// actual model name (e.g. "claude-sonnet-4-6"). This strips known prefixes.
+func (p *Provider) resolveModel(model string) string {
+	model = strings.TrimPrefix(model, "zai-")
+	model = strings.TrimPrefix(model, "zai/")
+	return model
 }
 
 type anthropicMessage struct {
@@ -353,7 +365,7 @@ func (p *Provider) Complete(ctx context.Context, req core.Request) (*core.Respon
 	core.WarnUnsupportedParams(ctx, p.Name(), req.Model, req, anthropicSupportedParams...)
 
 	aReq := anthropicRequest{
-		Model:         req.Model,
+		Model:         p.resolveModel(req.Model),
 		MaxTokens:     maxTokens,
 		Messages:      messages,
 		Temperature:   req.Temperature,
@@ -502,7 +514,7 @@ func (p *Provider) CompleteStream(ctx context.Context, req core.Request) (<-chan
 	core.WarnUnsupportedParams(ctx, p.Name(), req.Model, req, anthropicSupportedParams...)
 
 	aReq := anthropicRequest{
-		Model:         req.Model,
+		Model:         p.resolveModel(req.Model),
 		MaxTokens:     maxTokens,
 		Messages:      messages,
 		Temperature:   req.Temperature,
