@@ -104,7 +104,7 @@ func (p *Provider) SupportedModels() []string {
 // Only accepts zai-* and zai/* (routing prefixes) — NOT claude-*
 // directly, to avoid stealing requests from the anthropic provider.
 func (p *Provider) SupportsModel(model string) bool {
-	return strings.HasPrefix(model, "zai-") ||
+	return strings.HasPrefix(model, "zai/") ||
 		strings.HasPrefix(model, "zai/")
 }
 
@@ -117,7 +117,7 @@ func (p *Provider) Models() []core.ModelInfo {
 // Ferro routes requests by model prefix (e.g. "zai-"), but z.ai expects the
 // actual model name (e.g. "claude-sonnet-4-6"). This strips known prefixes.
 func (p *Provider) resolveModel(model string) string {
-	model = strings.TrimPrefix(model, "zai-")
+	model = strings.TrimPrefix(model, "zai/")
 	model = strings.TrimPrefix(model, "zai/")
 	return model
 }

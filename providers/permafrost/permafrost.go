@@ -108,7 +108,7 @@ func (p *Provider) SupportedModels() []string {
 // Permafrost is the default/fallback provider, so it handles both unprefixed
 // model names (e.g. "deepseek-chat") and prefixed ones (e.g. "ds-deepseek-chat").
 func (p *Provider) resolveModel(model string) string {
-	return strings.TrimPrefix(model, "ds-")
+	return strings.TrimPrefix(model, "ds/")
 }
 func (p *Provider) SupportsModel(model string) bool {
 	return true

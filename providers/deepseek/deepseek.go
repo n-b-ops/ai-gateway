@@ -77,10 +77,10 @@ func (p *Provider) SupportedModels() []string {
 // SupportsModel returns true if the model is supported by DeepSeek.
 // resolveModel strips the "ds-" routing prefix from the model name.
 func (p *Provider) resolveModel(model string) string {
-	return strings.TrimPrefix(model, "ds-")
+	return strings.TrimPrefix(model, "ds/")
 }
 func (p *Provider) SupportsModel(model string) bool {
-	return strings.HasPrefix(model, "deepseek-") || strings.HasPrefix(model, "ds-")
+	return strings.HasPrefix(model, "deepseek-") || strings.HasPrefix(model, "ds/")
 }
 
 // Models returns structured model metadata.
