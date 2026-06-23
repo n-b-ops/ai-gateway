@@ -26,6 +26,7 @@ import (
 	ollamapkg "github.com/ferro-labs/ai-gateway/providers/ollama"
 	ollamacloudpkg "github.com/ferro-labs/ai-gateway/providers/ollama_cloud"
 	openaipkg "github.com/ferro-labs/ai-gateway/providers/openai"
+	permafrostpkg "github.com/ferro-labs/ai-gateway/providers/permafrost"
 	openrouterpkg "github.com/ferro-labs/ai-gateway/providers/openrouter"
 	perplexitypkg "github.com/ferro-labs/ai-gateway/providers/perplexity"
 	qwenpkg "github.com/ferro-labs/ai-gateway/providers/qwen"
@@ -333,6 +334,17 @@ var allProviders = []ProviderEntry{
 		},
 		Build: func(cfg ProviderConfig) (Provider, error) {
 			return openrouterpkg.New(cfg[CfgKeyAPIKey], cfg[CfgKeyBaseURL])
+		},
+	},
+	{
+		ID:           NamePermafrost,
+		Capabilities: []string{CapabilityChat, CapabilityStream, CapabilityProxy},
+		EnvMappings: []EnvMapping{
+			{CfgKeyAPIKey, "PERMAFROST_API_KEY", true},
+			{CfgKeyBaseURL, "PERMAFROST_BASE_URL", false},
+		},
+		Build: func(cfg ProviderConfig) (Provider, error) {
+			return permafrostpkg.New(cfg[CfgKeyAPIKey], cfg[CfgKeyBaseURL])
 		},
 	},
 	{

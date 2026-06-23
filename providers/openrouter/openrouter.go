@@ -56,6 +56,10 @@ func (p *Provider) Name() string { return p.name }
 func (p *Provider) BaseURL() string { return p.baseURL }
 
 // AuthHeaders implements core.ProxiableProvider.
+// resolveModel strips the "or-" routing prefix from the model name.
+func (p *Provider) resolveModel(model string) string {
+	return strings.TrimPrefix(model, "or-")
+}
 func (p *Provider) AuthHeaders() map[string]string {
 	return map[string]string{"Authorization": "Bearer " + p.apiKey}
 }

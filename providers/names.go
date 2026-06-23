@@ -3,6 +3,7 @@ package providers
 import (
 	ai21pkg "github.com/ferro-labs/ai-gateway/providers/ai21"
 	anthropicpkg "github.com/ferro-labs/ai-gateway/providers/anthropic"
+	permafrostpkg "github.com/ferro-labs/ai-gateway/providers/permafrost"
 	zaipkg "github.com/ferro-labs/ai-gateway/providers/zai"
 	azurefoundrypkg "github.com/ferro-labs/ai-gateway/providers/azure_foundry"
 	azureopenaipkg "github.com/ferro-labs/ai-gateway/providers/azure_openai"
@@ -85,6 +86,9 @@ const (
 
 	// NameXAI is the canonical name for the xAI (Grok) provider.
 	NameXAI = xaipkg.Name
+
+	// NamePermafrost is the canonical name for the Permafrost DeepSeek proxy.
+	NamePermafrost = permafrostpkg.Name
 
 	// NameZAI is the canonical name for the z.ai Anthropic-compatible provider.
 	NameZAI = zaipkg.Name
@@ -172,6 +176,7 @@ func AllProviderNames() []string {
 		NameOllamaCloud,
 		NameOpenAI,
 		NameOpenRouter,
+		NamePermafrost,
 		NamePerplexity,
 		NameQwen,
 		NameReplicate,
