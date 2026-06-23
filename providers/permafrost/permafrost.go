@@ -104,6 +104,12 @@ func (p *Provider) SupportedModels() []string {
 // SupportsModel returns true for all models — Permafrost is a transparent proxy
 // that forwards any model name to DeepSeek. This ensures it acts as the
 // default fallback provider for unmatched model names.
+// resolveModel strips routing prefixes from the model name.
+// Permafrost is the default/fallback provider, so it handles both unprefixed
+// model names (e.g. "deepseek-chat") and prefixed ones (e.g. "ds-deepseek-chat").
+func (p *Provider) resolveModel(model string) string {
+	return strings.TrimPrefix(model, "ds-")
+}
 func (p *Provider) SupportsModel(model string) bool {
 	return true
 }
@@ -356,7 +362,7 @@ func (p *Provider) Complete(ctx context.Context, req core.Request) (*core.Respon
 	core.WarnUnsupportedParams(ctx, p.Name(), req.Model, req, anthropicSupportedParams...)
 
 	aReq := anthropicRequest{
-		Model:         req.Model,
+		Model:         p.resolveModel(req.Model),
 		MaxTokens:     maxTokens,
 		Messages:      messages,
 		Temperature:   req.Temperature,
@@ -505,7 +511,7 @@ func (p *Provider) CompleteStream(ctx context.Context, req core.Request) (<-chan
 	core.WarnUnsupportedParams(ctx, p.Name(), req.Model, req, anthropicSupportedParams...)
 
 	aReq := anthropicRequest{
-		Model:         req.Model,
+		Model:         p.resolveModel(req.Model),
 		MaxTokens:     maxTokens,
 		Messages:      messages,
 		Temperature:   req.Temperature,
