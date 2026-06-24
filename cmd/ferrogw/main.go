@@ -12,6 +12,7 @@ import (
 	_ "github.com/ferro-labs/ai-gateway/internal/plugins/budget"
 	_ "github.com/ferro-labs/ai-gateway/internal/plugins/cache"
 	_ "github.com/ferro-labs/ai-gateway/internal/plugins/cachealign"
+	_ "github.com/ferro-labs/ai-gateway/internal/plugins/keepalive"
 	_ "github.com/ferro-labs/ai-gateway/internal/plugins/logger"
 	_ "github.com/ferro-labs/ai-gateway/internal/plugins/maxtoken"
 	_ "github.com/ferro-labs/ai-gateway/internal/plugins/ratelimit"
