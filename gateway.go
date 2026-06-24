@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/ferro-labs/ai-gateway/internal/circuitbreaker"
+	"github.com/ferro-labs/ai-gateway/internal/coalesce"
 	"github.com/ferro-labs/ai-gateway/internal/events"
 	"github.com/ferro-labs/ai-gateway/internal/latency"
 	"github.com/ferro-labs/ai-gateway/internal/logging"
@@ -82,6 +83,10 @@ type Gateway struct {
 	// hot path without holding the gateway mutex — it is set once before
 	// traffic starts, so no additional synchronisation is required.
 	obsEventsActive bool
+
+	// coalescer coordinates parallel requests sharing an unseen prefix anchor
+	// to avoid cold-cache fan-out. nil when coalescing is disabled.
+	coalescer *coalesce.Coalescer
 
 	// MCP fields — nil when no MCPServers are configured.
 	mcpRegistry *mcp.Registry
@@ -149,6 +154,16 @@ func New(cfg Config) (*Gateway, error) {
 	gw.shutdownCtx, gw.shutdownCancel = context.WithCancel(context.Background()) //nolint:gosec // canceled by Gateway.Close()
 	gw.hookSnapshot.Store([]EventHookFunc{})
 	gw.startHookWorkers()
+
+	// Initialize coalescer if enabled.
+	if cfg.Coalescing.Enabled {
+		gw.coalescer = coalesce.New(coalesce.Config{
+			Enabled:  true,
+			SettleMs: cfg.Coalescing.SettleMs,
+			TimeoutS: cfg.Coalescing.TimeoutS,
+			Cap:      cfg.Coalescing.Cap,
+		})
+	}
 	gw.startCatalogRefresh()
 
 	// Wire MCP if any servers are configured.
@@ -492,9 +507,31 @@ func (g *Gateway) Route(ctx context.Context, req providers.Request) (*providers.
 	// Execute the strategy (provider selection + actual call).
 	var resp *providers.Response
 	providerStart := time.Now()
+
+	// Cold-anchor coalescing: if coalescer is active and this is a
+	// follower on a pending anchor, block until the leader releases.
+	var coalesceFingerprint string
+	if g.coalescer != nil {
+		coalesceFingerprint = coalesce.AnchorFingerprint(&req)
+		status, gate := g.coalescer.Acquire(coalesceFingerprint)
+		if status == coalesce.StatusFollower {
+			timeout := time.Duration(g.coalescer.Cfg.TimeoutS) * time.Second
+			gate.Wait(timeout)
+		}
+	}
+
 	trace.WithRegion(ctx, "gateway.route.provider.execute", func() {
 		resp, err = s.Execute(ctx, req)
 	})
+
+	// Release or fail the coalescer slot.
+	if g.coalescer != nil && coalesceFingerprint != "" {
+		if err != nil {
+			g.coalescer.Fail(coalesceFingerprint)
+		} else {
+			g.coalescer.Release(coalesceFingerprint)
+		}
+	}
 	providerDuration := time.Since(providerStart)
 	latency := time.Since(start)
 

@@ -28,6 +28,10 @@ type Config struct {
 	// gateway runs with a NoOp provider (zero allocations on the hot
 	// path). See internal/otel.
 	Observability ObservabilityConfig `json:"observability,omitempty" yaml:"observability,omitempty"`
+	// Coalescing configures cold-anchor coalescing: when multiple parallel
+	// requests share an unseen prefix anchor, only the leader warms the cache;
+	// followers block until the leader completes, then proceed on a warm prefix.
+	Coalescing CoalescingConfig `json:"coalescing,omitempty" yaml:"coalescing,omitempty"`
 }
 
 // ObservabilityConfig is the user-facing observability section of
@@ -183,6 +187,20 @@ type ABVariantConfig struct {
 	// Label is a short human-readable identifier (e.g. "control", "challenger").
 	// It is logged with every routed request for observability.
 	Label string `json:"label" yaml:"label"`
+}
+
+// CoalescingConfig configures cold-anchor coalescing.
+type CoalescingConfig struct {
+	// Enabled toggles coalescing on/off. Default: false (opt-in).
+	Enabled bool `json:"enabled" yaml:"enabled"`
+	// SettleMs is the extra wait after leader release for async cache write
+	// before followers proceed. Default: 2500 (2.5s).
+	SettleMs int `json:"settle_ms,omitempty" yaml:"settle_ms,omitempty"`
+	// TimeoutS is the maximum time a follower blocks before proceeding
+	// regardless. Default: 30.
+	TimeoutS int `json:"timeout_s,omitempty" yaml:"timeout_s,omitempty"`
+	// Cap is the maximum number of tracked anchors (LRU eviction). Default: 1024.
+	Cap int `json:"cap,omitempty" yaml:"cap,omitempty"`
 }
 
 // Target represents a specific provider target.
