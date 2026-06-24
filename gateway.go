@@ -2126,6 +2126,14 @@ func (g *Gateway) resolveAlias(req providers.Request) providers.Request {
 	return req
 }
 
+// ResolveAlias returns the resolved model name for the given alias, or the
+// original model name if no alias is configured. This is the exported form
+// of resolveModelAlias for use by handlers that need alias resolution before
+// calling FindByModel.
+func (g *Gateway) ResolveAlias(model string) string {
+	return g.resolveModelAlias(model)
+}
+
 // ── Multi-modal endpoints ────────────────────────────────────────────────────
 
 // Embed routes an embedding request to the first registered EmbeddingProvider

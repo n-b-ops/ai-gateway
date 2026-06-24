@@ -47,6 +47,7 @@ var (
 	_ core.StreamProvider    = (*Provider)(nil)
 	_ core.ProxiableProvider = (*Provider)(nil)
 	_ core.DiscoveryProvider = (*Provider)(nil)
+	_ core.AnthropicProvider = (*Provider)(nil)
 )
 
 // New creates a new Anthropic provider.
@@ -88,6 +89,21 @@ func (p *Provider) DiscoverModels(ctx context.Context) ([]core.ModelInfo, error)
 		"anthropic-version": anthropicVersion,
 	}
 	return discovery.DiscoverModelsWithHeaders(ctx, p.httpClient, p.baseURL+"/v1/models", headers, p.name)
+}
+
+// HandleAnthropicRequest implements core.AnthropicProvider. It forwards the raw
+// Anthropic Messages API request body to the Anthropic API, preserving the
+// native format without converting to OpenAI-shaped core.Request.
+func (p *Provider) HandleAnthropicRequest(ctx context.Context, body io.Reader) (*http.Response, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/v1/messages", body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	httpReq.Header.Set("x-api-key", p.apiKey)
+	httpReq.Header.Set("anthropic-version", anthropicVersion)
+	httpReq.Header.Set("content-type", "application/json")
+
+	return p.httpClient.Do(httpReq)
 }
 
 // SupportedModels returns the list of models supported by this provider.

@@ -10,7 +10,11 @@
 // to compile without changes.
 package core
 
-import "context"
+import (
+	"context"
+	"io"
+	"net/http"
+)
 
 // Provider defines the interface that all LLM providers must implement.
 type Provider interface {
@@ -69,4 +73,20 @@ type ProviderSource interface {
 	List() []string
 	AllModels() []ModelInfo
 	FindByModel(model string) (Provider, bool)
+}
+
+// AnthropicProvider is an optional interface for providers that speak the
+// Anthropic Messages API natively. The gateway uses this to forward raw
+// Anthropic-format requests without converting to the OpenAI-shaped
+// core.Request intermediate, preserving tool definitions, thinking blocks,
+// and content block fidelity.
+type AnthropicProvider interface {
+	Provider
+	ProxiableProvider
+
+	// HandleAnthropicRequest forwards a raw Anthropic Messages API request body
+	// to the provider. The returned *http.Response body must be closed by the
+	// caller. This is used for the native Anthropic path where format conversion
+	// would lose fidelity.
+	HandleAnthropicRequest(ctx context.Context, body io.Reader) (*http.Response, error)
 }

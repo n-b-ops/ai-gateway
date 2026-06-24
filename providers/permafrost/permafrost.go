@@ -2,6 +2,7 @@
 package permafrost
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -48,6 +49,7 @@ var (
 	_ core.StreamProvider    = (*Provider)(nil)
 	_ core.ProxiableProvider = (*Provider)(nil)
 	_ core.DiscoveryProvider = (*Provider)(nil)
+	_ core.AnthropicProvider = (*Provider)(nil)
 )
 
 // New creates a new Anthropic provider.
@@ -348,6 +350,74 @@ func parseDataURI(uri string) (mediaType, data string, ok bool) {
 		return "", "", false
 	}
 	return mediaType, payload, true
+}
+
+// HandleAnthropicRequest implements core.AnthropicProvider. It forwards the raw
+// Anthropic Messages API request body to the Permafrost upstream, preserving
+// the native format without converting to OpenAI-shaped core.Request.
+//
+// The model name in the body is stripped of the routing prefix (ds/) before
+// forwarding, matching the behavior of resolveModel in Complete/CompleteStream.
+func (p *Provider) HandleAnthropicRequest(ctx context.Context, body io.Reader) (*http.Response, error) {
+	// Read the body so we can rewrite the model field if needed.
+	bodyBytes, err := io.ReadAll(body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read request body: %w", err)
+	}
+
+	// If the model name has a routing prefix, rewrite it in the JSON.
+	// This is a best-effort optimization; most requests through the
+	// /v1/messages handler will already have a clean model name from
+	// alias resolution.
+	bodyBytes = p.rewriteModelField(bodyBytes)
+
+	bodyReader := bytes.NewReader(bodyBytes)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/v1/messages", bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	httpReq.Header.Set("x-api-key", p.apiKey)
+	httpReq.Header.Set("anthropic-version", anthropicVersion)
+	httpReq.Header.Set("content-type", "application/json")
+
+	return p.httpClient.Do(httpReq)
+}
+
+// rewriteModelField rewrites the "model" field in the JSON body if it contains
+// a routing prefix (ds/). Returns the original bytes unchanged if no rewrite
+// is needed.
+func (p *Provider) rewriteModelField(body []byte) []byte {
+	// Fast path: check if model field starts with "ds/"
+	idx := bytes.Index(body, []byte(`"model"`))
+	if idx < 0 {
+		return body
+	}
+	// Find the value after "model":
+	rest := body[idx+7:] // skip past "model"
+	colonIdx := bytes.IndexByte(rest, ':')
+	if colonIdx < 0 {
+		return body
+	}
+	rest = rest[colonIdx+1:]
+	// Skip whitespace.
+	for len(rest) > 0 && (rest[0] == ' ' || rest[0] == '\t' || rest[0] == '\n') {
+		rest = rest[1:]
+	}
+	if len(rest) < 3 || rest[0] != '"' {
+		return body
+	}
+	// Read the quoted string.
+	endIdx := bytes.IndexByte(rest[1:], '"')
+	if endIdx < 0 {
+		return body
+	}
+	model := string(rest[1 : 1+endIdx])
+	resolved := p.resolveModel(model)
+	if resolved == model {
+		return body
+	}
+	// Replace in the full body.
+	return bytes.Replace(body, []byte(`"`+model+`"`), []byte(`"`+resolved+`"`), 1)
 }
 
 // Complete sends a chat completion request to Permafrost (DeepSeek proxy).

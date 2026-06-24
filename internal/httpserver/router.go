@@ -199,6 +199,9 @@ func mountOpenAIRoutes(r chi.Router, gw *aigateway.Gateway, registry *providers.
 		r.Get("/v1/models", handler.Models(gw))
 		r.Post("/v1/chat/completions", handler.ChatCompletions(gw))
 
+		// Anthropic Messages API endpoint — full routing + OTEL.
+		r.Post("/v1/messages", handler.Messages(gw))
+
 		// Legacy text completions.
 		r.Post("/v1/completions", handler.Completions(registry))
 
