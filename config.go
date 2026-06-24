@@ -130,6 +130,10 @@ type StrategyConfig struct {
 	ContentConditions []ContentCondition `json:"content_conditions,omitempty" yaml:"content_conditions,omitempty"`
 	// ABVariants defines the weighted variants for the ab-test strategy.
 	ABVariants []ABVariantConfig `json:"ab_variants,omitempty" yaml:"ab_variants,omitempty"`
+	// KeyRoutes maps API key values to target provider names. When a request's
+	// API key matches a key in this map, the corresponding target is used
+	// regardless of model-based conditions. Keys are matched by exact value.
+	KeyRoutes map[string]string `json:"key_routes,omitempty" yaml:"key_routes,omitempty"`
 }
 
 // StrategyMode represents the routing strategy mode.
@@ -213,6 +217,10 @@ type Target struct {
 	Retry *RetryConfig `json:"retry,omitempty" yaml:"retry,omitempty"`
 	// CircuitBreaker configuration for this target (optional).
 	CircuitBreaker *CircuitBreakerConfig `json:"circuit_breaker,omitempty" yaml:"circuit_breaker,omitempty"`
+	// ModelOverride rewrites req.Model before forwarding to the provider.
+	// Useful for virtual model names that map to different real models per target.
+	// Empty means pass through the original model name unchanged.
+	ModelOverride string `json:"model_override,omitempty" yaml:"model_override,omitempty"`
 }
 
 // RetryConfig defines retry behavior for the fallback strategy.

@@ -14,6 +14,15 @@ type contextKey string
 
 const apiKeyContextKey contextKey = "api_key"
 
+// rawKeyStringKey is a simple-string context key for the raw API key value.
+// It exists so packages that can't import internal/admin (circular dependency
+// avoidance) can still read the API key from the context using:
+//
+//	if v := ctx.Value("raw_api_key"); v != nil {
+//	    keyStr, _ = v.(string)
+//	}
+const rawKeyStringKey = "raw_api_key"
+
 // API key permission scopes.
 const (
 	ScopeAdmin    = "admin"
@@ -71,6 +80,7 @@ func AuthMiddleware(store Store, masterKey string) func(http.Handler) http.Handl
 			// 1. Master key check (always active if set).
 			if masterKey != "" && subtle.ConstantTimeCompare([]byte(key), []byte(masterKey)) == 1 {
 				ctx := context.WithValue(r.Context(), apiKeyContextKey, masterAPIKey)
+				ctx = context.WithValue(ctx, rawKeyStringKey, key)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return
 			}
@@ -98,6 +108,9 @@ func AuthMiddleware(store Store, masterKey string) func(http.Handler) http.Handl
 			}
 
 			ctx := context.WithValue(r.Context(), apiKeyContextKey, apiKey)
+			// Also store the raw key string for use by routing code that
+			// can't import the admin package (circular dependency avoidance).
+			ctx = context.WithValue(ctx, rawKeyStringKey, apiKey.Key)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

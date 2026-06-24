@@ -445,6 +445,9 @@ func (g *Gateway) Route(ctx context.Context, req providers.Request) (*providers.
 		req = g.resolveAlias(req)
 	})
 
+	// Apply per-key routing and model_override.
+	g.applyKeyRoute(ctx, &req)
+
 	s, err := g.getStrategy()
 	if err != nil {
 		return nil, err
@@ -2171,7 +2174,52 @@ func (g *Gateway) ResolveAlias(model string) string {
 	return g.resolveModelAlias(model)
 }
 
-// ── Multi-modal endpoints ────────────────────────────────────────────────────
+// applyKeyRoute checks the request context for an API key and, if key_routes is
+// configured, rewrites req.Model so the configured target matches. It also
+// applies model_override if the selected target has one.
+func (g *Gateway) applyKeyRoute(ctx context.Context, req *providers.Request) {
+	g.mu.RLock()
+	keyRoutes := g.config.Strategy.KeyRoutes
+	targets := g.config.Targets
+	g.mu.RUnlock()
+
+	if len(keyRoutes) == 0 {
+		return
+	}
+
+	// Try to extract the API key from the request context.
+	keyStr := g.apiKeyFromContext(ctx)
+	if keyStr == "" {
+		return
+	}
+
+	// Check if this key has a dedicated route target.
+	targetName, ok := keyRoutes[keyStr]
+	if !ok {
+		return
+	}
+
+	// If the target has a model_override, apply it.
+	for _, t := range targets {
+		if t.VirtualKey == targetName && t.ModelOverride != "" {
+			req.Model = t.ModelOverride
+			break
+		}
+	}
+}
+
+// apiKeyFromContext extracts the raw API key string from the request context.
+// The admin middleware stores the raw key string using a simple-string context
+// key ("raw_api_key") alongside the typed key, specifically so this package
+// can read it without importing internal/admin (circular dependency).
+func (g *Gateway) apiKeyFromContext(ctx context.Context) string {
+	if v := ctx.Value("raw_api_key"); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
 
 // Embed routes an embedding request to the first registered EmbeddingProvider
 // that supports the requested model.
